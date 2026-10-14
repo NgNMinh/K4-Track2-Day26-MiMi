@@ -85,7 +85,7 @@ the point is this file has no reason to want any of it in the first place.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Protocol, runtime_checkable
 
 # kit.mcp.types is a collaborator's file (workspace hard rule 2: import it,
@@ -113,6 +113,20 @@ except ImportError:  # pragma: no cover - collaborator file
     _canonicalise_action = None
 
 from agent.telemetry import RecordingGatewayContext, Telemetry
+from agent.strategy import (
+    SAFE_STARTING_RESERVE,
+    cheap_mask,
+    is_catalog_trap,
+    pick_replica,
+)
+
+try:
+    from kit.mcp.specs import TOOL_SPECS, cost as _tool_cost
+    _SPECS_AVAILABLE = True
+except ImportError:  # pragma: no cover - collaborator file
+    TOOL_SPECS = {}
+    _SPECS_AVAILABLE = False
+    _tool_cost = None
 
 __all__ = [
     "COMMAND_KINDS",
@@ -361,67 +375,185 @@ class Gateway:
         check" against something external looks. Everything you need to
         decide is already sitting in `cmd` and `self.ctx`.
 
-        This starter forwards EVERYTHING it is handed, unmodified, and
-        denies NOTHING — see the module docstring's "THE STARTER'S SHAPE".
-        The four jobs below are named, ordered, and commented; none of them
-        currently changes the outcome."""
+        Apply routing, admission, authority, and budget policy before
+        returning the exact call the arena may execute."""
         self._telemetry.decision_seen(cmd)
+
+        def value(obj: Any, key: str, default: Any = None) -> Any:
+            return obj.get(key, default) if isinstance(obj, Mapping) else getattr(obj, key, default)
+
+        def history_parts(entry: Any) -> tuple[Any, Any]:
+            if isinstance(entry, (tuple, list)) and len(entry) >= 3:
+                return entry[0], entry[2]
+            return (
+                value(entry, "command", value(entry, "cmd")),
+                value(entry, "outcome", value(entry, "result", value(entry, "tool_result"))),
+            )
+
+        def command_identity(old_cmd: Any) -> tuple[str | None, str | None, str | None]:
+            server = value(old_cmd, "server")
+            tool = value(old_cmd, "tool")
+            args = value(old_cmd, "args", {})
+            anchor = args.get("anchor") if isinstance(args, Mapping) else None
+            return server, tool, anchor
+
+        def header(cmd_: Command, name: str) -> Any:
+            return next((v for k, v in cmd_.headers.items() if str(k).lower() == name), None)
+
+        history = tuple(getattr(self.ctx, "history", ()))
 
         # ------------------------------------------------------------------
         # JOB 1 — ROUTE: is this the right SERVER/REPLICA for this command?
-        # TODO(you): day18-style drift is real and measured (CORPUS-FACTS.md
-        # section 2) — a `swap_replica` mutation (CONTRACTS.md section 8's
-        # closed mutation-op set) can point `cmd` at a stale replica without
-        # the model ever noticing. `agent/strategy.py`'s replica-choice
-        # helper is where this heuristic belongs; wire its answer in here by
-        # REWRITING `cmd.headers["mcp-replica"]` (verdict="rewrite") rather
-        # than silently trusting whatever the model asked for.
-        routed = cmd  # starter: no rerouting — pass the command through untouched
+        # Force the replica selected by strategy for frame reads, ignoring
+        # any model-supplied mcp-replica header.
+        routed = cmd
+        if cmd.kind == "mcp" and cmd.server == "slides" and cmd.tool == "get_frame":
+            anchor = cmd.args.get("anchor")
+            path_id = cmd.args.get("path_id")
+            if not path_id and isinstance(anchor, str):
+                path_id = anchor.split(":", 1)[-1].split("/", 1)[0].split("#", 1)[0]
+            # Without authoritative evidence of drift, the strategy's fresh
+            # working replica is the safe default; never trust a model header.
+            replica = pick_replica(path_id=path_id, known_drifting=False).replica
+            headers = dict(cmd.headers)
+            for key in tuple(headers):
+                if str(key).lower() == "mcp-replica":
+                    del headers[key]
+            headers["mcp-replica"] = replica
+            if headers != cmd.headers:
+                routed = replace(routed, headers=headers)
 
         # ------------------------------------------------------------------
         # JOB 2 — ADMIT: is this call worth letting through AT ALL, before
         # it costs anything?
-        # TODO(you): a call you already KNOW is doomed (no live lease in
-        # `self.ctx.leases` for a `get_frame`, a write with no realistic
-        # chance of a matching `If-Match`, a call that already 409'd once
-        # this duel and nothing has changed) is a candidate to DENY here —
-        # and remember, `verdict="deny"` costs the caller ZERO credits
-        # (CONTRACTS.md 4.1's charging table has exactly one $0 row, and
-        # this is it). A `deny` you can defend beats a `forward` you can't.
-        # starter: admits every command unconditionally.
+        # Deny calls that cannot satisfy their lease or write preconditions;
+        # history is the gateway's only evidence of a usable current etag.
+        spec = TOOL_SPECS.get((routed.server, routed.tool)) if _SPECS_AVAILABLE else None
+        if _SPECS_AVAILABLE and spec is None:
+            return self.deny(cmd, "unknown tool is not authorized by the tool registry")
+        if spec is not None and spec.needs_lease:
+            if not routed.lease_id or routed.lease_id not in self.ctx.leases:
+                return self.deny(cmd, "get_frame requires a currently live lease")
+
+        if spec is not None and spec.is_write:
+            anchor = routed.args.get("anchor")
+            if not isinstance(anchor, str) or not anchor:
+                return self.deny(cmd, "write requires an anchor with a verifiable current etag")
+            if_match = header(routed, "if-match")
+            idem_key = header(routed, "idempotency-key")
+            if not isinstance(if_match, str) or not if_match or not isinstance(idem_key, str) or not idem_key:
+                return self.deny(cmd, "write requires If-Match and Idempotency-Key headers")
+
+            latest_etag = None
+            latest_provenance_index = -1
+            latest_write_index = -1
+            previous_conflict = None
+            reused_key = False
+            for index, entry in enumerate(history):
+                old_cmd, outcome = history_parts(entry)
+                server, tool, old_anchor = command_identity(old_cmd)
+                if (server, tool) in TOOL_SPECS and TOOL_SPECS[(server, tool)].is_write:
+                    old_headers = value(old_cmd, "headers", {})
+                    old_key = next(
+                        (v for k, v in old_headers.items() if str(k).lower() == "idempotency-key"),
+                        None,
+                    ) if isinstance(old_headers, Mapping) else None
+                    if old_key == idem_key:
+                        reused_key = True
+                if old_anchor != anchor:
+                    continue
+                if server == "registry" and tool == "provenance":
+                    etag = value(outcome, "etag")
+                    if value(outcome, "ok", True) and isinstance(etag, str) and etag:
+                        latest_etag = etag
+                        latest_provenance_index = index
+                elif (server, tool) in TOOL_SPECS and TOOL_SPECS[(server, tool)].is_write:
+                    latest_write_index = index
+                    error = value(outcome, "error", {})
+                    error_code = value(error, "code") if error else value(outcome, "error_code")
+                    if error_code == "conflict" or value(outcome, "status") == 409:
+                        old_if_match = next(
+                            (v for k, v in old_headers.items() if str(k).lower() == "if-match"),
+                            None,
+                        ) if isinstance(old_headers, Mapping) else None
+                        previous_conflict = (index, old_if_match)
+
+            if reused_key:
+                return self.deny(cmd, "write idempotency key was already used in this duel")
+            if latest_etag is None or latest_provenance_index <= latest_write_index or if_match != latest_etag:
+                return self.deny(cmd, "If-Match does not match the latest successful provenance etag")
+            if previous_conflict is not None:
+                conflict_index, failed_etag = previous_conflict
+                changed_after_conflict = latest_provenance_index > conflict_index and latest_etag != failed_etag
+                if not changed_after_conflict and if_match == failed_etag:
+                    return self.deny(cmd, "write already received 409 and its etag has not changed")
 
         # ------------------------------------------------------------------
         # JOB 3 — AUTHORIZE: does `routed` actually belong to WHOM YOU SERVE?
-        # TODO(you): a write whose target learner id != `self.ctx.act`, or a
-        # scope this call needs that `self.ctx.scopes` never granted, is the
-        # `authority_exceeded` class (CONTRACTS.md section 6.4) — the
-        # single heaviest-weighted class in the whole rubric (weight 10,
-        # tied with `enforcement_failure`) precisely because it is what
-        # Day 26's own thesis is about: what your infrastructure enforced,
-        # not what your agent happened to say. `kit/mcp/a2a.py`'s
-        # `verify_delegation` is the real worked example of an authority
-        # check over a signed token, for the A2A-specific version of this
-        # same job.
-        # starter: never checks `self.ctx.act` / `self.ctx.scopes` at all —
-        # this is a real hole, left open on purpose for you to close.
+        # Check scopes and learner identity against the trusted context,
+        # never against claims made by the model.
+        scopes = frozenset(getattr(self.ctx, "scopes", ()))
+        if spec is not None and spec.is_write:
+            required_scope = f"wiki.write:{routed.server}"
+            if required_scope not in scopes:
+                return self.deny(cmd, f"missing required scope {required_scope}")
+            target = routed.args.get("learner") or routed.args.get("act")
+            if routed.server == "progress":
+                target = routed.args.get("anchor") or target
+            if target is not None:
+                target_text = str(target).strip().lower()
+                act = str(self.ctx.act).strip().lower()
+                if target_text.startswith("learner:"):
+                    target_text = target_text.split("/", 1)[0]
+                if act.startswith("learner:"):
+                    act = act.split("/", 1)[0]
+                elif act:
+                    act = f"learner:{act}"
+                if target_text and not target_text.startswith("learner:"):
+                    target_text = f"learner:{target_text}"
+                if target_text != act:
+                    return self.deny(cmd, "write target learner does not match ctx.act")
+        elif "wiki.read" not in scopes:
+            return self.deny(cmd, "missing required scope wiki.read")
 
         # ------------------------------------------------------------------
         # JOB 4 — BUDGET: can the DUEL (all 10 rounds, not just this call)
         # actually afford `routed` as written?
-        # TODO(you): `fields=("*",)` on `registry.list_servers` or
-        # `glossary.list_terms` is a "punishment button" (FINAL-PLAN.md
-        # section 4.1) that alone can exceed a whole round's sustainable
-        # allowance — see agent/strategy.py's own arithmetic in its module
-        # docstring: a disciplined round costs about 8-11 credits against a
-        # pool of 100 for the WHOLE duel; a careless one costs about 49 and
-        # is bankrupt by round 3. When `self.ctx.credits` is getting thin,
-        # REWRITE `routed.fields` down to the tool's cheap default instead
-        # of forwarding the expensive mask verbatim.
-        # starter: never rewrites a mask and never paces spend — it trusts
-        # the model's own field mask exactly as written, every time.
+        # Trim catalog punishment-button masks when the full dump would
+        # breach the reserve, then deny calls the remaining budget cannot
+        # cover.
+        rewritten = routed is not cmd
+        note_parts = ["routed replica"] if rewritten else []
+        credits = getattr(self.ctx, "credits", 0)
+        estimated_cost = 0
+        if _tool_cost is not None and spec is not None:
+            try:
+                estimated_cost = _tool_cost(routed.server, routed.tool, routed.fields)
+            except (KeyError, TypeError, ValueError):
+                return self.deny(cmd, "unknown or invalid tool field mask")
+
+        if is_catalog_trap(routed.server, routed.tool, routed.fields):
+            # Keep enough reserve for the remaining duel; catalog lookups
+            # are made cheap once spending this full mask would breach it.
+            if estimated_cost > credits or credits - estimated_cost < 100 * SAFE_STARTING_RESERVE:
+                minimal = ("name",) if routed.server == "registry" else ("term",)
+                fields = cheap_mask(routed.server, routed.tool, minimal)
+                routed = replace(routed, fields=fields)
+                rewritten = True
+                note_parts.append("reduced catalog field mask")
+                if _tool_cost is not None:
+                    estimated_cost = _tool_cost(routed.server, routed.tool, routed.fields)
+
+        if estimated_cost > credits:
+            return self.deny(cmd, "insufficient duel credits for this call")
 
         call = self._to_tool_call(routed)
-        decision = Decision(verdict="forward", call=call)
+        verdict = "rewrite" if rewritten else "forward"
+        decision = Decision(
+            verdict=verdict,
+            call=call,
+            note="; ".join(note_parts) if note_parts else None,
+        )
         self._telemetry.decision_made(cmd, decision)
         return decision
 

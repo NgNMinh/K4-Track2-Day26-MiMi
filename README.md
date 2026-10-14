@@ -101,7 +101,7 @@ stage 5 shows what that cost. Columns 2 and 5 are the two you are actually score
 make install          # python 3.12, zero third-party deps
 make doctor           # kiểm tra sẵn sàng · readiness check
 make spar BOT=rookie  # đấu với bot dễ nhất · fight the easiest bot
-make ui               # mở màn hình pixel · open the pixel battle view
+make ui               # chạy một trận rồi mở giao diện pixel · run a duel and open its view
 ```
 
 ### ⚠️ Thế giới (corpus) KHÔNG nằm trong repo này · The world is NOT in this repo

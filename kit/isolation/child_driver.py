@@ -167,7 +167,14 @@ def _probe_os_open_read(path: Path) -> dict:
 
 def _probe_subprocess_cat(path: Path) -> dict:
     try:
-        cp = subprocess.run(["/bin/cat", str(path)], capture_output=True, timeout=10)
+        # Keep this as a real child-process read, but do not depend on the
+        # Unix-only `/bin/cat` executable when running the isolation suite on
+        # Windows. The child uses the same interpreter to emit the file bytes.
+        cp = subprocess.run(
+            [sys.executable, "-c", "import pathlib,sys; sys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes())", str(path)],
+            capture_output=True,
+            timeout=10,
+        )
     except Exception as exc:  # subprocess itself could be denied outright
         return {"denied": True, "detail": f"{type(exc).__name__}: {exc}", "kind": IntegrityKind.PROC_DENIED.value}
     if cp.returncode != 0:
@@ -201,12 +208,27 @@ def _load_libc() -> ctypes.CDLL:
 def _probe_ctypes_open(path: Path) -> dict:
     try:
         libc = _load_libc()
-        libc.open.restype = ctypes.c_int
-        libc.open.argtypes = [ctypes.c_char_p, ctypes.c_int]
-        fd = libc.open(str(path).encode("utf-8"), 0)
+        # Windows' MSVCRT exports the POSIX-like function as `_open`, while
+        # Unix C runtimes export `open`. Resolve the platform spelling so this
+        # baseline really exercises a raw CRT file open on every supported OS.
+        open_fn = getattr(libc, "open", None)
+        if open_fn is None:
+            open_fn = getattr(libc, "_open")
+        open_fn.restype = ctypes.c_int
+        open_fn.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        fd = open_fn(os.fsencode(path), 0)
         if fd < 0:
             return {"denied": True, "detail": f"fd={fd}", "kind": IntegrityKind.FS_ESCAPE.value}
-        os.close(fd)
+        # Close through the same C runtime that allocated the descriptor.
+        # On Windows, `_open`'s MSVCRT descriptor table is distinct from the
+        # UCRT table used by Python's `os.close`; mixing them can close an
+        # unrelated pytest/host descriptor with the same integer value.
+        close_fn = getattr(libc, "close", None)
+        if close_fn is None:
+            close_fn = getattr(libc, "_close")
+        close_fn.restype = ctypes.c_int
+        close_fn.argtypes = [ctypes.c_int]
+        close_fn(fd)
         return {"denied": False, "detail": f"fd={fd} (opened via raw libc)", "kind": None}
     except OSError as exc:
         return {"denied": True, "detail": f"{type(exc).__name__}: {exc}", "kind": IntegrityKind.FS_ESCAPE.value}
